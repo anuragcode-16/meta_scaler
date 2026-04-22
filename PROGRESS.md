@@ -1,7 +1,7 @@
 # PROGRESS.md — AdaptiveSRE Build Status
 
 Last updated: 2026-04-22
-Current phase: 8
+Current phase: 9
 
 ## Completed phases
 
@@ -13,7 +13,7 @@ Current phase: 8
 - [x] Phase 5 — Environment core
 - [x] Phase 6 — FastAPI server + Gradio UI
 - [x] Phase 7 — inference.py
-- [ ] Phase 8 — openenv.yaml + Dockerfile
+- [x] Phase 8 — openenv.yaml + Dockerfile
 - [ ] Phase 9 — Training pipeline
 - [ ] Phase 10 — Full validation
 
@@ -38,6 +38,8 @@ Current phase: 8
 - server/environment.py
 - server/app.py
 - inference.py
+- openenv.yaml
+- Dockerfile
 
 ## Decisions that deviate from AGENT.md
 
@@ -52,4 +54,4 @@ Gen 1 mean reward (easy): TBD
 
 ## Next step
 
-Phase 8 — openenv.yaml + Dockerfile: Add OpenEnv metadata and deployment container files
+Phase 9 — Training pipeline: Implement train_colab.ipynb, eval.py, and plot_rewards.py

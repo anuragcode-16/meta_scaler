@@ -160,7 +160,7 @@ def build_ui() -> gr.Blocks:
             headers=["service", "health", "bar"],
             datatype=["str", "str", "str"],
             row_count=(5, "fixed"),
-            column_count=(3, "fixed"),
+            col_count=(3, "fixed"),
             label="Services",
             interactive=False,
         )
@@ -190,5 +190,9 @@ demo = build_ui()
 app = gr.mount_gradio_app(app, demo, path="/")
 
 
-if __name__ == "__main__":
+def main() -> None:
     demo.launch(server_name="0.0.0.0", server_port=7860)
+
+
+if __name__ == "__main__":
+    main()

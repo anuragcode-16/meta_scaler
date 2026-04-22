@@ -1,0 +1,32 @@
+---
+name: adaptive-sre
+version: "1.0.0"
+description: >
+  AdaptiveSRE benchmarks theory of mind in agentic systems.
+  An SRE agent must simultaneously resolve infrastructure incidents
+  AND infer a hidden Lead Engineer's silently-drifting priority mode
+  from reward signals alone.
+tags: [openenv, sre, reinforcement-learning, theory-of-mind, self-improvement]
+author: AdaptiveSRE Team
+tasks:
+  - name: easy
+    description: Single service fault, lead mode stated in alert, 8 steps
+    max_steps: 8
+    difficulty: easy
+  - name: medium
+    description: 2-service cascade, lead mode hidden but fixed, 12 steps
+    max_steps: 12
+    difficulty: medium
+  - name: hard
+    description: Full cascade with silent policy drift at random step 8-14, 20 steps
+    max_steps: 20
+    difficulty: hard
+env_vars:
+  - API_BASE_URL
+  - MODEL_NAME
+  - HF_TOKEN
+endpoints:
+  reset: POST /reset
+  step: POST /step
+  state: GET /state
+  health: GET /health
