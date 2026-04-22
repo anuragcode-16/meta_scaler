@@ -1,0 +1,81 @@
+version: "3.8"
+
+services:
+  db:
+    build:
+      context: ./db
+      dockerfile: Dockerfile
+    ports:
+      - "15432:15432"
+    networks:
+      - sre-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5432/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  auth:
+    build:
+      context: ./auth
+      dockerfile: Dockerfile
+    ports:
+      - "8102:8102"
+    networks:
+      - sre-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8102/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  payment:
+    build:
+      context: ./payment
+      dockerfile: Dockerfile
+    ports:
+      - "8101:8101"
+    networks:
+      - sre-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8101/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  cache:
+    build:
+      context: ./cache
+      dockerfile: Dockerfile
+    ports:
+      - "6379:6379"
+    networks:
+      - sre-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6379/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  notification:
+    build:
+      context: ./notification
+      dockerfile: Dockerfile
+    ports:
+      - "8103:8103"
+    networks:
+      - sre-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8103/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+networks:
+  sre-network:
+    driver: bridge
