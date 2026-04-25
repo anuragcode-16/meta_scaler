@@ -77,8 +77,25 @@ Summary across 2 runs:
 - Training time: ~75-80 min on CPU
 - Runs completed: 2 (reproducible)
 
-Gen 0 hard task baseline: TBD
+Hard task run (latest, long run):
+
+- Checkpoint save reported: ./checkpoints/gen1_hard/final
+- Validation episodes: 8
+- Baseline (hard): +0.022
+- Trained (hard): -0.030
+- Delta: -0.052 (regression)
+
+Drift-detection status:
+
+- Suspected failure/regression on hard task (post-training performance dropped below baseline)
+- Requires focused debugging of drift detection and adaptation behavior before claiming hard-task success
+
+Artifact/path note:
+
+- Notebook output printed /kaggle/working/Adaptive-SRE/checkpoints/gen1_hard/results.json
+- Follow-up message reported that path as missing
+- Treat this hard-task run as provisional until results.json path/write is confirmed
 
 ## Next step
 
-Phase 10 — Full validation: Run Colab validation and record measured training/eval results
+Phase 10 — Full validation: rerun hard-task training/eval, verify results artifact path, and debug drift-detection regression
