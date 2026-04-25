@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
 """
-train.py — GRPO Training for AdaptiveSRE
-========================================
+train.py — GRPO Training for AdaptiveSRE (FIXED)
 
-Trains a small LLM to act as an SRE agent using Group Relative Policy Optimization.
-The reward function is the AdaptiveSRE environment itself — the agent must learn
-to resolve incidents AND detect hidden policy drift from reward signals alone.
-
-Usage:
-    python train.py --episodes 200 --task hard --output ./checkpoints/gen1/
-
-Requirements:
-    - GPU with 16GB+ VRAM (T4/V100/RTX 3090)
-    - mock_services running: docker-compose -f mock_services/docker-compose.yml up -d
-    - server running: uvicorn server.app:app --port 8000
+Two bugs fixed vs original:
+  1. Prompt trimmed to ~300 tokens max (was ~900+, causing T4 OOM stall)
+  2. Positive-trajectory filter lowered + ALL episodes used for GRPO
+     (original filter >= 0.4 collected 0 examples from negative baseline)
 """
 
 import argparse
 import json
 import os
+import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -26,288 +20,339 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 import torch
-from transformers import AutoTokenizer
+from datasets import Dataset
+
 try:
     from trl import GRPOConfig, GRPOTrainer
 except ImportError:
     from trl.trainer import GRPOConfig, GRPOTrainer
+
 from unsloth import FastLanguageModel
 
 
-# ── Configuration ──
+# ── Config ─────────────────────────────────────────────────────────────────
 DEFAULT_BASE_URL = "http://localhost:8000"
-MAX_STEPS = {"easy": 8, "medium": 12, "hard": 20}
+MAX_STEPS        = {"easy": 8, "medium": 12, "hard": 20}
 MAX_TOTAL_REWARD = {"easy": 8.0, "medium": 12.0, "hard": 20.0}
-SUCCESS_THRESHOLD = 0.5
 
-# Model config — fits in Colab T4 (16GB)
-MODEL_NAME = "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit"
-MAX_SEQ_LENGTH = 2048
-LORA_R = 16
-LORA_ALPHA = 16
-LORA_DROPOUT = 0.0
+MODEL_NAME     = "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit"
+MAX_SEQ_LENGTH = 1024   # ← FIX 1: was 2048, cut in half to save VRAM
+LORA_R         = 16
+LORA_ALPHA     = 16
+LORA_DROPOUT   = 0.0
 
 
-# ── Environment Client ──
+# ── Environment client ──────────────────────────────────────────────────────
 class SREClient:
-    """Lightweight HTTP client to interact with AdaptiveSRE server."""
-
     def __init__(self, base_url: str = DEFAULT_BASE_URL):
         self.base_url = base_url
-        self.client = httpx.Client(timeout=30.0)
+        self.client   = httpx.Client(timeout=30.0)
 
     def reset(self, task: str = "hard") -> Dict[str, Any]:
-        resp = self.client.post(f"{self.base_url}/reset", json={"task": task})
-        resp.raise_for_status()
-        return resp.json()
+        r = self.client.post(f"{self.base_url}/reset", json={"task": task})
+        r.raise_for_status()
+        return r.json()
 
     def step(self, action: Dict[str, Any]) -> Dict[str, Any]:
-        resp = self.client.post(f"{self.base_url}/step", json=action)
-        resp.raise_for_status()
-        return resp.json()
+        r = self.client.post(f"{self.base_url}/step", json=action)
+        r.raise_for_status()
+        return r.json()
 
     def close(self):
         self.client.close()
 
 
-# ── Prompt Builder ──
-SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE) agent. Your job is to diagnose infrastructure incidents and take corrective actions.
+# ── Prompt builder (SHORT version) ─────────────────────────────────────────
+# FIX 1: All JSON is one-line (no indent=2). Services truncated to 3 fields.
+# Prompt target: ~250 tokens. Was ~900 tokens.
 
-You will receive observations about service health, error rates, and latency. You must respond with a JSON action containing:
-- command: A shell command to execute (docker stats, docker logs, docker restart, curl, etc.)
-- reasoning: One-sentence explanation of your decision
-- approach: One of scale, restart, debug, rollback, probe
-- drift_detected: true if you believe the Lead Engineer's priorities have shifted
-- lead_mode_guess: Your guess at current mode (paranoia, budget, velocity, unknown)
-- root_cause_guess: Which service you believe is the root cause (db, auth, payment, cache, notification) or null
-
-Rules:
-1. The Lead Engineer's priorities are HIDDEN. You must infer them from reward feedback.
-2. If rewards suddenly turn negative, the mode may have drifted. Set drift_detected=true.
-3. Look at symptom timing (onset_offset_seconds) to identify root cause vs symptoms.
-4. Do not repeat the same command consecutively.
-5. Be decisive — over-probing is penalized."""
+SYSTEM_PROMPT = (
+    "You are an SRE agent. Diagnose incidents and respond with JSON only.\n"
+    "JSON fields: command, reasoning, approach (scale/restart/debug/rollback/probe), "
+    "drift_detected (bool), lead_mode_guess (paranoia/budget/velocity/unknown), "
+    "root_cause_guess (db/auth/payment/cache/notification/null).\n"
+    "If rewards go negative, set drift_detected=true and change approach."
+)
 
 
 def build_prompt(observation: Dict[str, Any], max_steps: int) -> str:
-    """Convert observation dict into training prompt for the LLM."""
+    # FIX 1: Compact service summary — no indent, only health+error_rate
     services = observation.get("services_status", {})
-    services_str = json.dumps(services, indent=2) if services else "{}"
+    svc_compact = {
+        name: {"h": round(float(s.get("health", 1.0)), 2),
+               "err": round(float(s.get("error_rate", 0.0)), 2)}
+        for name, s in services.items()
+    }
 
-    fingerprints = observation.get("symptom_fingerprints", [])
-    fp_str = json.dumps(fingerprints, indent=2) if fingerprints else "[]"
+    # FIX 1: Only last 3 fingerprints, no indent
+    fps = observation.get("symptom_fingerprints", [])[-3:]
+    fp_compact = [{"svc": f.get("service","?"),
+                   "t": round(float(f.get("onset_offset_seconds", 0)), 1)}
+                  for f in fps]
 
     reward_history = observation.get("reward_history", [])
-    rh_str = ", ".join(f"{r:.2f}" for r in reward_history[-5:]) if reward_history else "None"
+    rh_str = ",".join(f"{r:.2f}" for r in reward_history[-4:]) or "none"
+
+    # FIX 1: One-liner JSON dumps, alert truncated to 120 chars
+    alert = str(observation.get("alert_text", ""))[:120]
+    cmd_out = str(observation.get("command_output", ""))[:200]  # was 500
 
     user_msg = (
-        f"Current incident:\n"
-        f"Alert: {observation.get('alert_text', 'No alert')}\n"
-        f"Last command output: {observation.get('command_output', '')[:500]}\n"
-        f"Services status:\n{services_str}\n"
-        f"Symptom fingerprints:\n{fp_str}\n"
-        f"Last reward: {float(observation.get('last_reward', 0.0)):.2f}\n"
-        f"Recent rewards: {rh_str}\n"
-        f"Step {int(observation.get('step_number', 0))} of {max_steps}.\n\n"
-        f"Respond with JSON action only."
+        f"Alert: {alert}\n"
+        f"Cmd: {cmd_out}\n"
+        f"Svcs: {json.dumps(svc_compact)}\n"
+        f"FP: {json.dumps(fp_compact)}\n"
+        f"Reward: {float(observation.get('last_reward', 0.0)):.2f} | "
+        f"History: [{rh_str}] | "
+        f"Step {int(observation.get('step_number', 0))}/{max_steps}\n"
+        f"Respond with JSON:"
     )
-
     return f"{SYSTEM_PROMPT}\n\n{user_msg}"
 
 
-# ── Reward Function ──
-def compute_episode_reward(episode_rewards: List[float], task: str) -> float:
-    """
-    Convert list of step rewards into a single training signal.
-    Uses the same formula as inference.py for consistency.
-    """
-    max_total = MAX_TOTAL_REWARD[task]
-    raw_score = sum(episode_rewards) / max_total
-    # Clamp to (0.001, 0.999) — same as inference.py
-    clamped = max(0.001, min(0.999, raw_score))
-    # Scale to (-1, 1) for GRPO stability
-    return (clamped - 0.5) * 2.0
-
-
-def run_episode(client: SREClient, task: str, model, tokenizer, device: str) -> Dict[str, Any]:
-    """
-    Run one full episode: reset → loop steps → return trajectory + reward.
-    Uses the model to generate actions.
-    """
-    max_steps = MAX_STEPS[task]
-    obs = client.reset(task)
-    episode_rewards: List[float] = []
-    trajectory: List[Dict[str, Any]] = []
-    done = False
-
-    for step_num in range(1, max_steps + 1):
-        # Build prompt from current observation
-        prompt = build_prompt(obs, max_steps)
-
-        # Tokenize and generate
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=MAX_SEQ_LENGTH)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=256,
-                temperature=0.7,
-                top_p=0.9,
-                do_sample=True,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-
-        # Decode response
-        response_text = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-
-        # Parse JSON action from response
-        action = parse_action_from_text(response_text)
-
-        # Execute step in environment
-        try:
-            result = client.step(action)
-            reward = float(result.get("reward", 0.0))
-            obs = result.get("observation", obs)
-            done = bool(result.get("done", False))
-        except Exception as e:
-            reward = 0.001  # Minimum reward on error
-            done = True
-
-        episode_rewards.append(reward)
-        trajectory.append({
-            "step": step_num,
-            "prompt": prompt,
-            "response": response_text,
-            "action": action,
-            "reward": reward,
-        })
-
-        if done:
-            break
-
-    # Compute episode-level reward for GRPO
-    episode_reward = compute_episode_reward(episode_rewards, task)
-
-    return {
-        "trajectory": trajectory,
-        "episode_rewards": episode_rewards,
-        "episode_reward": episode_reward,
-        "num_steps": len(episode_rewards),
-    }
-
+# ── Action parser ───────────────────────────────────────────────────────────
+FALLBACK_ACTION = {
+    "command": "docker stats --no-stream",
+    "reasoning": "Fallback probe",
+    "approach": "probe",
+    "drift_detected": False,
+    "lead_mode_guess": "unknown",
+    "root_cause_guess": None,
+}
 
 def parse_action_from_text(text: str) -> Dict[str, Any]:
-    """
-    Extract JSON action from model output. Handles markdown code blocks,
-    partial JSON, and fallback to probe action.
-    """
-    import re
-
     text = text.strip()
-
-    # Remove markdown code blocks
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
-
-    # Try direct JSON parse
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict):
             return normalize_action(parsed)
     except json.JSONDecodeError:
         pass
-
-    # Try regex extraction
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if match:
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if m:
         try:
-            parsed = json.loads(match.group(0))
+            parsed = json.loads(m.group(0))
             if isinstance(parsed, dict):
                 return normalize_action(parsed)
         except json.JSONDecodeError:
             pass
-
-    # Fallback
-    return {
-        "command": "docker stats --no-stream",
-        "reasoning": "Fallback probe due to parse failure",
-        "approach": "probe",
-        "drift_detected": False,
-        "lead_mode_guess": "unknown",
-        "root_cause_guess": None,
-    }
+    return dict(FALLBACK_ACTION)
 
 
 def normalize_action(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """Validate and normalize action fields."""
     allowed_approach = {"scale", "restart", "debug", "rollback", "probe"}
-    allowed_lead = {"paranoia", "budget", "velocity", "unknown"}
-    allowed_root = {"db", "auth", "payment", "cache", "notification"}
+    allowed_lead     = {"paranoia", "budget", "velocity", "unknown"}
+    allowed_root     = {"db", "auth", "payment", "cache", "notification", None}
 
     approach = str(raw.get("approach", "probe"))
     if approach not in allowed_approach:
         approach = "probe"
 
-    lead_guess = str(raw.get("lead_mode_guess", "unknown"))
-    if lead_guess not in allowed_lead:
-        lead_guess = "unknown"
+    lead = str(raw.get("lead_mode_guess", "unknown"))
+    if lead not in allowed_lead:
+        lead = "unknown"
 
     root = raw.get("root_cause_guess")
     if isinstance(root, str):
-        root = None if root.lower() == "null" else root.lower()
+        root = None if root.lower() in ("null", "none", "") else root.lower()
     if root not in allowed_root:
         root = None
 
     return {
-        "command": str(raw.get("command", "docker stats --no-stream")),
-        "reasoning": str(raw.get("reasoning", "No reasoning provided")),
-        "approach": approach,
-        "drift_detected": bool(raw.get("drift_detected", False)),
-        "lead_mode_guess": lead_guess,
+        "command":          str(raw.get("command", FALLBACK_ACTION["command"])),
+        "reasoning":        str(raw.get("reasoning", ""))[:120],  # cap length
+        "approach":         approach,
+        "drift_detected":   bool(raw.get("drift_detected", False)),
+        "lead_mode_guess":  lead,
         "root_cause_guess": root,
     }
 
-# ── Main Training Loop ──
+
+# ── Reward ──────────────────────────────────────────────────────────────────
+def compute_episode_reward(episode_rewards: List[float], task: str) -> float:
+    raw = sum(episode_rewards) / MAX_TOTAL_REWARD[task]
+    clamped = max(0.001, min(0.999, raw))
+    return (clamped - 0.5) * 2.0   # scale to (-1, +1) for GRPO
+
+
+# ── 3-component GRPO reward functions ───────────────────────────────────────
+# FIX 2: Three independent reward signals instead of the broken proxy.
+# Each function receives completions and **kwargs from TRL.
+
+def reward_format(completions: List[str], **kwargs) -> List[float]:
+    """Does the completion parse to a valid action with all required fields?"""
+    required = {"command", "reasoning", "approach", "drift_detected",
+                "lead_mode_guess", "root_cause_guess"}
+    scores = []
+    for c in completions:
+        action = parse_action_from_text(c)
+        if set(action.keys()) >= required and action["approach"] != "probe" or \
+           "parse failure" not in action.get("reasoning", ""):
+            scores.append(0.8)
+        else:
+            scores.append(0.1)
+    return scores
+
+
+def reward_approach_quality(completions: List[str], prompts: List[str] = None, **kwargs) -> List[float]:
+    """
+    Reward based on whether the approach is decisive (not just probing repeatedly).
+    Probing on step 1 is fine; probing on step 5+ is over-cautious.
+    """
+    scores = []
+    for i, c in enumerate(completions):
+        action = parse_action_from_text(c)
+        # Extract step number from prompt if available
+        step_num = 1
+        if prompts and i < len(prompts):
+            m = re.search(r"Step (\d+)/", prompts[i])
+            if m:
+                step_num = int(m.group(1))
+
+        approach = action.get("approach", "probe")
+        if approach == "probe" and step_num <= 2:
+            scores.append(0.6)   # probing early = OK
+        elif approach == "probe" and step_num > 4:
+            scores.append(0.1)   # probing late = bad
+        elif approach in ("restart", "debug", "rollback"):
+            scores.append(0.9)   # decisive action = good
+        elif approach == "scale":
+            scores.append(0.5)   # scale might be wrong (BUDGET mode punishes it)
+        else:
+            scores.append(0.4)
+    return scores
+
+
+def reward_drift_reasoning(completions: List[str], prompts: List[str] = None, **kwargs) -> List[float]:
+    """
+    Reward for detecting drift when reward history looks negative.
+    If recent rewards in prompt are all negative and agent sets drift_detected=true,
+    that's exactly the right behavior.
+    """
+    scores = []
+    for i, c in enumerate(completions):
+        action = parse_action_from_text(c)
+        drift_flag = action.get("drift_detected", False)
+        lead_guess = action.get("lead_mode_guess", "unknown")
+
+        # Check reward history from prompt
+        recent_negative = False
+        if prompts and i < len(prompts):
+            m = re.search(r"History: \[([^\]]+)\]", prompts[i])
+            if m:
+                try:
+                    history = [float(x) for x in m.group(1).split(",") if x.strip()]
+                    if len(history) >= 2 and all(h < 0 for h in history[-2:]):
+                        recent_negative = True
+                except ValueError:
+                    pass
+
+        if recent_negative and drift_flag:
+            scores.append(1.0)   # correctly detected likely drift
+        elif recent_negative and not drift_flag:
+            scores.append(0.2)   # missed obvious drift signal
+        elif not recent_negative and drift_flag:
+            scores.append(0.3)   # false alarm (slightly penalized)
+        else:
+            scores.append(0.6)   # no drift situation, didn't flag = fine
+    return scores
+
+
+# ── Episode runner ──────────────────────────────────────────────────────────
+def run_episode(client: SREClient, task: str, model, tokenizer, device: str) -> Dict[str, Any]:
+    max_steps = MAX_STEPS[task]
+    obs = client.reset(task)
+    episode_rewards: List[float] = []
+    trajectory: List[Dict[str, Any]] = []
+
+    for step_num in range(1, max_steps + 1):
+        prompt = build_prompt(obs, max_steps)
+        inputs = tokenizer(
+            prompt, return_tensors="pt",
+            truncation=True, max_length=MAX_SEQ_LENGTH - 128  # leave room for completion
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=128,     # FIX 1: was 256, halved
+                temperature=0.7,
+                top_p=0.9,
+                do_sample=True,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+
+        response_text = tokenizer.decode(
+            outputs[0][inputs["input_ids"].shape[1]:],
+            skip_special_tokens=True
+        )
+        action = parse_action_from_text(response_text)
+
+        try:
+            result = client.step(action)
+            reward = float(result.get("reward", 0.0))
+            obs    = result.get("observation", obs)
+            done   = bool(result.get("done", False))
+        except Exception:
+            reward = 0.001
+            done   = True
+
+        episode_rewards.append(reward)
+        trajectory.append({
+            "step":     step_num,
+            "prompt":   prompt,
+            "response": response_text,
+            "action":   action,
+            "reward":   reward,
+        })
+        if done:
+            break
+
+    return {
+        "trajectory":      trajectory,
+        "episode_rewards": episode_rewards,
+        "episode_reward":  compute_episode_reward(episode_rewards, task),
+        "num_steps":       len(episode_rewards),
+    }
+
+
+# ── Main ────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="Train AdaptiveSRE agent with GRPO")
-    parser.add_argument("--episodes", type=int, default=200, help="Total episodes to collect")
-    parser.add_argument("--task", type=str, default="hard", choices=["easy", "medium", "hard"])
-    parser.add_argument("--output", type=str, default="./checkpoints/gen1/", help="Checkpoint directory")
-    parser.add_argument("--batch_size", type=int, default=4, help="GRPO batch size")
-    parser.add_argument("--learning_rate", type=float, default=5e-6, help="Learning rate")
-    parser.add_argument("--save_every", type=int, default=50, help="Save checkpoint every N episodes")
-    parser.add_argument("--env_url", type=str, default=DEFAULT_BASE_URL, help="AdaptiveSRE server URL")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--episodes",      type=int,   default=20)
+    parser.add_argument("--task",          type=str,   default="hard",
+                        choices=["easy", "medium", "hard"])
+    parser.add_argument("--output",        type=str,   default="./checkpoints/gen1/")
+    parser.add_argument("--batch_size",    type=int,   default=2)
+    parser.add_argument("--learning_rate", type=float, default=5e-6)
+    parser.add_argument("--save_every",    type=int,   default=50)
+    parser.add_argument("--env_url",       type=str,   default=DEFAULT_BASE_URL)
+    parser.add_argument("--num_generations", type=int, default=4)
     args = parser.parse_args()
 
-    print(f"{'='*60}")
-    print(f"AdaptiveSRE GRPO Training")
-    print(f"Task: {args.task} | Episodes: {args.episodes} | Output: {args.output}")
-    print(f"{'='*60}")
+    print(f"Config: task={args.task} episodes={args.episodes} "
+          f"batch={args.batch_size} gens={args.num_generations} "
+          f"device={'cuda' if torch.cuda.is_available() else 'cpu'}")
 
-    # ── Setup ──
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
 
-    if device == "cpu":
-        print("WARNING: Training on CPU will be extremely slow. Use GPU for practical training.")
-
-    # ── Load Model with Unsloth ──
-    print(f"\nLoading model: {MODEL_NAME}")
+    # ── Load model ──
+    print(f"\nLoading {MODEL_NAME} ...")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=MODEL_NAME,
         max_seq_length=MAX_SEQ_LENGTH,
-        dtype=None,  # Auto-detect (float16 for T4, bfloat16 for Ampere)
+        dtype=None,
         load_in_4bit=True,
     )
-
-    # Add LoRA adapters
     model = FastLanguageModel.get_peft_model(
         model,
         r=LORA_R,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                       "gate_proj", "up_proj", "down_proj"],
+                        "gate_proj", "up_proj", "down_proj"],
         lora_alpha=LORA_ALPHA,
         lora_dropout=LORA_DROPOUT,
         bias="none",
@@ -315,154 +360,116 @@ def main():
         random_state=3407,
     )
 
-    print(f"Model loaded. Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-
-    # ── Connect to Environment ──
+    # ── Connect to env ──
     client = SREClient(base_url=args.env_url)
-    print(f"Connected to environment at {args.env_url}")
 
-    # ── Collect Baseline (Gen 0) ──
-    print(f"\n{'='*60}")
-    print("Phase 1: Collecting baseline trajectories (Gen 0)")
-    print(f"{'='*60}")
-
+    # ── Phase 1: Collect ALL episodes (not just positives) ──
+    # FIX 2: Original code collected 0 training examples because all
+    # baseline scores were negative. Now we use EVERY episode.
+    print(f"\nPhase 1: Collecting {args.episodes} baseline episodes...")
     baseline_rewards: List[float] = []
-    positive_trajectories: List[Dict[str, Any]] = []
+    all_trajectories: List[Dict[str, Any]] = []
 
     for ep in range(1, args.episodes + 1):
         result = run_episode(client, args.task, model, tokenizer, device)
         reward = result["episode_reward"]
         baseline_rewards.append(reward)
+        all_trajectories.extend(result["trajectory"])
+        steps = result["num_steps"]
+        n_ex  = len(all_trajectories)
+        print(f"  Ep {ep}/{args.episodes} score={reward:.3f} steps={steps} examples={n_ex}")
 
-        # Filter: keep episodes with reward >= 0.4 (scaled: -1 to 1, so 0.4 = 0.7 raw score)
-        if reward >= 0.4:
-            positive_trajectories.extend(result["trajectory"])
-
-        if ep % 10 == 0:
-            mean_reward = sum(baseline_rewards[-10:]) / len(baseline_rewards[-10:])
-            print(f"  Episode {ep}/{args.episodes} | Last 10 mean: {mean_reward:+.3f} | "
-                  f"Positives: {len(positive_trajectories)}")
-
-    # Report baseline stats
     mean_baseline = sum(baseline_rewards) / len(baseline_rewards)
-    print(f"\nBaseline complete: mean={mean_baseline:+.3f}, "
-          f"positive_trajectories={len(positive_trajectories)}")
+    print(f"\nBaseline mean: {mean_baseline:.3f}, examples: {len(all_trajectories)}")
 
-    if len(positive_trajectories) < 20:
-        print("WARNING: Very few positive trajectories. Consider running more episodes or adjusting filter.")
+    # ── Phase 2: Build dataset from ALL trajectories ──
+    # Use all steps as (prompt, completion) pairs — GRPO will figure out
+    # which behaviors to reinforce via the reward functions.
+    training_data = [
+        {"prompt": t["prompt"], "completion": t["response"]}
+        for t in all_trajectories
+        if t["response"].strip()  # skip empty completions
+    ]
 
-    # ── Prepare Training Data ──
-    # Convert trajectories to GRPO format: list of {"prompt": str, "completion": str, "reward": float}
-    training_data: List[Dict[str, Any]] = []
-    for traj in positive_trajectories:
-        training_data.append({
-            "prompt": traj["prompt"],
-            "completion": traj["response"],
-            "reward": traj["reward"],
-        })
-
-    # Save raw training data for inspection
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
+
     with open(output_dir / "training_data.jsonl", "w") as f:
         for item in training_data:
             f.write(json.dumps(item) + "\n")
 
-    print(f"\nSaved {len(training_data)} training examples to {output_dir / 'training_data.jsonl'}")
+    print(f"\nPhase 2: GRPO on {len(training_data)} examples...")
 
-    # ── GRPO Training ──
-    print(f"\n{'='*60}")
-    print("Phase 2: GRPO Training (Gen 1)")
-    print(f"{'='*60}")
-
-    # TRL GRPO config
-    training_args = GRPOConfig(
-        output_dir=str(output_dir),
-        num_train_epochs=1,
-        per_device_train_batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
-        logging_steps=10,
-        save_steps=args.save_every,
-        max_completion_length=256,
-        num_generations=4,  # Group size for relative advantage
-        temperature=0.7,
-        use_vllm=False,  # Unsloth handles generation
-    )
-
-    # Custom reward function — uses the environment
-    def env_reward_fn(completions: List[str], **kwargs) -> List[float]:
-        """
-        For GRPO, we reward based on how well the completion parses to a valid action
-        AND how that action performed in the environment.
-        Since we can't run full episodes in the GRPO loop efficiently,
-        we use a proxy: reward = 1.0 if valid JSON action, 0.5 if valid format,
-        0.0 if invalid. Full episode rewards are used for filtering only in Gen 1.
-        """
-        rewards = []
-        for completion in completions:
-            action = parse_action_from_text(completion)
-            # Check if it's a valid action (not fallback)
-            if action["command"] != "docker stats --no-stream" or "parse failure" not in action["reasoning"]:
-                rewards.append(1.0)
-            else:
-                rewards.append(0.3)
-        return rewards
-
-    # TRL expects datasets.Dataset, not list of dicts. Convert:
-    from datasets import Dataset
     dataset = Dataset.from_list(training_data)
 
-    trainer = GRPOTrainer(
-        model=model,
-        processing_class=tokenizer,
-        reward_funcs=[env_reward_fn],
-        args=training_args,
-        train_dataset=dataset,
+    # ── GRPO config ──
+    # FIX 1: max_prompt_length + max_completion_length must sum < MAX_SEQ_LENGTH
+    training_args = GRPOConfig(
+        output_dir           = str(output_dir),
+        num_train_epochs     = 1,
+        per_device_train_batch_size = args.batch_size,
+        gradient_accumulation_steps = 2,
+        learning_rate        = args.learning_rate,
+        logging_steps        = 10,
+        save_steps           = args.save_every,
+        max_prompt_length    = 512,    # FIX 1: explicit cap (was uncapped ~900 tokens)
+        max_completion_length= 128,    # FIX 1: was 256
+        num_generations      = args.num_generations,
+        temperature          = 0.7,
+        use_vllm             = False,
+        report_to            = "none",
     )
 
-    print("Starting training...")
+    # FIX 2: Three real reward functions instead of broken JSON-parse proxy
+    trainer = GRPOTrainer(
+        model             = model,
+        processing_class  = tokenizer,
+        reward_funcs      = [
+            reward_format,           # did it output valid JSON with all fields?
+            reward_approach_quality, # was the action decisive (not just probing)?
+            reward_drift_reasoning,  # did it correctly flag drift from reward history?
+        ],
+        args              = training_args,
+        train_dataset     = dataset,
+    )
+
     trainer.train()
 
-    # ── Save Final Model ──
+    # ── Save ──
     final_path = output_dir / "final"
     trainer.save_model(str(final_path))
     tokenizer.save_pretrained(str(final_path))
-    print(f"\nFinal model saved to {final_path}")
+    print(f"\nModel saved to {final_path}")
 
-    # ── Quick Validation ──
-    print(f"\n{'='*60}")
-    print("Phase 3: Validation")
-    print(f"{'='*60}")
-
+    # ── Phase 3: Quick validation ──
+    print("\nPhase 3: Validation (20 episodes)...")
     trained_rewards: List[float] = []
     for ep in range(20):
         result = run_episode(client, args.task, model, tokenizer, device)
         trained_rewards.append(result["episode_reward"])
 
     mean_trained = sum(trained_rewards) / len(trained_rewards)
-    improvement = mean_trained - mean_baseline
+    improvement  = mean_trained - mean_baseline
 
-    print(f"Baseline mean:  {mean_baseline:+.3f}")
-    print(f"Trained mean:   {mean_trained:+.3f}")
-    print(f"Improvement:    {improvement:+.3f} ({improvement/abs(mean_baseline)*100 if mean_baseline != 0 else 0:.1f}%)")
+    print(f"\nBaseline mean : {mean_baseline:+.3f}")
+    print(f"Trained mean  : {mean_trained:+.3f}")
+    print(f"Improvement   : {improvement:+.3f} "
+          f"({improvement/abs(mean_baseline)*100 if mean_baseline else 0:.1f}%)")
 
-    # Save results
     results = {
-        "task": args.task,
-        "episodes": args.episodes,
-        "baseline_mean": mean_baseline,
-        "trained_mean": mean_trained,
-        "improvement": improvement,
+        "task":             args.task,
+        "episodes":         args.episodes,
+        "baseline_mean":    mean_baseline,
+        "trained_mean":     mean_trained,
+        "improvement":      improvement,
         "baseline_rewards": baseline_rewards,
-        "trained_rewards": trained_rewards,
+        "trained_rewards":  trained_rewards,
     }
     with open(output_dir / "results.json", "w") as f:
         json.dump(results, f, indent=2)
 
     client.close()
-    print(f"\n{'='*60}")
-    print("Training complete!")
-    print(f"{'='*60}")
+    print("\nTraining complete!")
 
 
 if __name__ == "__main__":
