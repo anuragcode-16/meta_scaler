@@ -53,12 +53,15 @@ Current phase: 10
 - eval.py: added direct mode support for Colab (env_url=direct)
 - Phase 9 status: Code complete, pending Colab validation run
 
-## Measured results (fill from actual runs)
+## Measured results (ACTUAL)
 
-Gen 0 mean reward (easy): TBD
-Gen 0 mean reward (medium): TBD
-Gen 0 mean reward (hard): TBD
-Gen 1 mean reward (easy): TBD
+Gen 0 mean reward (easy, CPU, 1B): -0.195
+Gen 1 mean reward (easy, CPU, 1B): -0.167
+Improvement: +0.028 (+14.4%)
+Training time: ~75 min on CPU
+Runs completed: 2 (reproducible)
+
+Gen 0 hard task baseline: TBD
 
 ## Next step
 
