@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-train.py — GRPO Training for AdaptiveSRE (FIXED)
+train.py — GRPO Training for AdaptiveSRE (OPTIMIZED)
 
-Two bugs fixed vs original:
+Improvements:
   1. Prompt trimmed to ~300 tokens max (was ~900+, causing T4 OOM stall)
-  2. Positive-trajectory filter lowered + ALL episodes used for GRPO
-     (original filter >= 0.4 collected 0 examples from negative baseline)
+  2. ALL episodes used for GRPO (original filter collected 0 examples)
+  3. W&B integration for experiment tracking
+  4. 3 training epochs with cosine LR scheduler + warmup
+  5. Higher LoRA alpha (32) for better adaptation
+  6. bf16/fp16 auto-detection for Kaggle GPUs
+  7. Weighted multi-component reward functions
 """
 
 import argparse
@@ -20,6 +24,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 import torch
+import wandb
 from datasets import Dataset
 
 try:
@@ -38,7 +43,7 @@ MAX_TOTAL_REWARD = {"easy": 8.0, "medium": 12.0, "hard": 20.0}
 MODEL_NAME     = "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit"
 MAX_SEQ_LENGTH = 1024   # ← FIX 1: was 2048, cut in half to save VRAM
 LORA_R         = 16
-LORA_ALPHA     = 16
+LORA_ALPHA     = 32      # ← doubled: alpha/r=2 gives better LoRA adaptation
 LORA_DROPOUT   = 0.0
 
 
@@ -323,20 +328,40 @@ def run_episode(client: SREClient, task: str, model, tokenizer, device: str) -> 
 # ── Main ────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--episodes",      type=int,   default=20)
+    parser.add_argument("--episodes",      type=int,   default=30)
     parser.add_argument("--task",          type=str,   default="hard",
                         choices=["easy", "medium", "hard"])
     parser.add_argument("--output",        type=str,   default="./checkpoints/gen1/")
     parser.add_argument("--batch_size",    type=int,   default=2)
-    parser.add_argument("--learning_rate", type=float, default=5e-6)
+    parser.add_argument("--learning_rate", type=float, default=2e-5)
     parser.add_argument("--save_every",    type=int,   default=50)
     parser.add_argument("--env_url",       type=str,   default=DEFAULT_BASE_URL)
     parser.add_argument("--num_generations", type=int, default=4)
+    parser.add_argument("--epochs",        type=int,   default=3)
+    parser.add_argument("--wandb_project", type=str,   default="adaptive-sre")
     args = parser.parse_args()
+
+    # ── W&B Setup ──
+    os.environ["WANDB_API_KEY"] = "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"
+    wandb.init(
+        project=args.wandb_project,
+        config={
+            "task": args.task,
+            "episodes": args.episodes,
+            "batch_size": args.batch_size,
+            "learning_rate": args.learning_rate,
+            "num_generations": args.num_generations,
+            "epochs": args.epochs,
+            "model": MODEL_NAME,
+            "lora_r": LORA_R,
+            "lora_alpha": LORA_ALPHA,
+            "max_seq_length": MAX_SEQ_LENGTH,
+        },
+    )
 
     print(f"Config: task={args.task} episodes={args.episodes} "
           f"batch={args.batch_size} gens={args.num_generations} "
-          f"device={'cuda' if torch.cuda.is_available() else 'cpu'}")
+          f"epochs={args.epochs} device={'cuda' if torch.cuda.is_available() else 'cpu'}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -378,8 +403,11 @@ def main():
         steps = result["num_steps"]
         n_ex  = len(all_trajectories)
         print(f"  Ep {ep}/{args.episodes} score={reward:.3f} steps={steps} examples={n_ex}")
+        wandb.log({"baseline/episode_reward": reward, "baseline/steps": steps,
+                   "baseline/total_examples": n_ex, "baseline/episode": ep})
 
     mean_baseline = sum(baseline_rewards) / len(baseline_rewards)
+    wandb.log({"baseline/mean_reward": mean_baseline})
     print(f"\nBaseline mean: {mean_baseline:.3f}, examples: {len(all_trajectories)}")
 
     # ── Phase 2: Build dataset from ALL trajectories ──
@@ -402,22 +430,30 @@ def main():
 
     dataset = Dataset.from_list(training_data)
 
-    # ── GRPO config ──
-    # FIX 1: max_prompt_length + max_completion_length must sum < MAX_SEQ_LENGTH
+    # ── GRPO config (optimized for Kaggle T4/P100) ──
+    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    use_fp16 = torch.cuda.is_available() and not use_bf16
+
     training_args = GRPOConfig(
         output_dir           = str(output_dir),
-        num_train_epochs     = 1,
+        num_train_epochs     = args.epochs,
         per_device_train_batch_size = args.batch_size,
-        gradient_accumulation_steps = 2,
+        gradient_accumulation_steps = 4,
         learning_rate        = args.learning_rate,
-        logging_steps        = 10,
+        lr_scheduler_type    = "cosine",
+        warmup_ratio         = 0.1,
+        weight_decay         = 0.01,
+        logging_steps        = 5,
         save_steps           = args.save_every,
-        max_prompt_length    = 512,    # FIX 1: explicit cap (was uncapped ~900 tokens)
-        max_completion_length= 128,    # FIX 1: was 256
+        max_prompt_length    = 512,
+        max_completion_length= 128,
         num_generations      = args.num_generations,
         temperature          = 0.7,
         use_vllm             = False,
-        report_to            = "none",
+        report_to            = "wandb",
+        bf16                 = use_bf16,
+        fp16                 = use_fp16,
+        max_grad_norm        = 1.0,
     )
 
     # FIX 2: Three real reward functions instead of broken JSON-parse proxy
@@ -447,6 +483,8 @@ def main():
     for ep in range(20):
         result = run_episode(client, args.task, model, tokenizer, device)
         trained_rewards.append(result["episode_reward"])
+        wandb.log({"validation/episode_reward": result["episode_reward"],
+                   "validation/steps": result["num_steps"], "validation/episode": ep + 1})
 
     mean_trained = sum(trained_rewards) / len(trained_rewards)
     improvement  = mean_trained - mean_baseline
@@ -455,6 +493,14 @@ def main():
     print(f"Trained mean  : {mean_trained:+.3f}")
     print(f"Improvement   : {improvement:+.3f} "
           f"({improvement/abs(mean_baseline)*100 if mean_baseline else 0:.1f}%)")
+
+    # ── Log final results to W&B ──
+    wandb.log({
+        "final/baseline_mean": mean_baseline,
+        "final/trained_mean": mean_trained,
+        "final/improvement": improvement,
+        "final/improvement_pct": improvement / abs(mean_baseline) * 100 if mean_baseline else 0,
+    })
 
     results = {
         "task":             args.task,
@@ -468,7 +514,13 @@ def main():
     with open(output_dir / "results.json", "w") as f:
         json.dump(results, f, indent=2)
 
+    # ── Save model artifact to W&B ──
+    artifact = wandb.Artifact("adaptive-sre-model", type="model")
+    artifact.add_dir(str(final_path))
+    wandb.log_artifact(artifact)
+
     client.close()
+    wandb.finish()
     print("\nTraining complete!")
 
 
