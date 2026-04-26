@@ -1,14 +1,36 @@
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
-.env
 .venv/
 venv/
+myenv/
+
+# Secrets
+.env
+
+# Model artifacts
 checkpoints/
 *.pt
 *.bin
 *.safetensors
+
+# Runtime / logs
 eval_results.json
 inference_output.txt
 *.log
+server.log
+
+# OS
 .DS_Store
+
+# Internal docs (strategy, build guides — not for judges)
+AGENT.md
+MASTER_BUILD_GUIDE.md
+PROGRESS.md
+
+# Lock files (not needed for judging, large file)
+uv.lock
+
+# Duplicate/scratch notebooks (keep train_colab.ipynb, hide the rough draft)
+rain_colab.ipynb
