@@ -65,12 +65,12 @@ Real production incidents are different. On-call engineers simultaneously diagno
 
 **AdaptiveSRE is the first RL benchmark that captures this.** The agent must solve two simultaneous hidden inference problems — the incident state AND the current evaluation criterion — where the second one can silently change at a random moment during the episode.
 
-|                        | kube-sre-gym            | AdaptiveSRE                                    |
-| ---------------------- | ----------------------- | ---------------------------------------------- |
-| Hidden states          | 1 (which pod is broken) | **2 (incident + lead mode)**                   |
-| Reward function        | Fixed                   | **Non-stationary, drifts mid-episode**         |
-| Baseline failure mode  | Slow diagnosis          | **Optimizing for wrong objective after drift** |
-| Key learned capability | Fault diagnosis         | **Drift detection + strategy pivot**           |
+Key benchmark properties:
+
+- Hidden states: **2 (incident + lead mode)**
+- Reward function: **Non-stationary, drifts mid-episode**
+- Core failure mode: **Optimizing for the wrong objective after drift**
+- Key learned capability: **Drift detection + strategy pivot**
 
 ---
 
