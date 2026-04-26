@@ -338,6 +338,16 @@ _Updated with measured actuals after onsite training — April 25–26, 2026. No
 
 ---
 
+## Inline Plots
+
+![Reward Curve](plots/reward_curve.png)
+
+![Loss Curve](plots/loss_curve.png)
+
+![Alignment Demo](plots/alignment_demo.png)
+
+---
+
 ## Quick Start
 
 ```python
